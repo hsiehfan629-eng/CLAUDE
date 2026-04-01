@@ -1,439 +1,335 @@
-"""Audit detail test implementations: vouching, tracing, recalculation, analytical."""
+"""Revenue detail testing: 5 verification checks.
 
-from decimal import Decimal
+① System info vs contract consistency (customer, product, spec, price)
+② Delivery note consistency (delivery no, qty, date vs signed receipt)
+③ Revenue amount accuracy (recalculation)
+④ Revenue timing compliance (sign date <= confirm date, same month)
+⑤ Signer authorization verification
+"""
+
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
-from audit.models import (
-    AuditFinding,
-    AuditTestConfig,
-    ProcessedDocument,
-    ExtractedTable,
-)
-from audit.comparator import DataComparator
-from utils.helpers import parse_financial_amount, clean_text
+from config import CONFIG
+from audit.models import DeliveryGroup, DocumentInfo, VerificationSummary
+from utils.helpers import parse_financial_amount, normalize_date, clean_text
 
 
-class DetailTestRunner:
-    """Run audit detail tests on extracted PDF data against Excel samples."""
+class RevenueVerifier:
+    """Execute the 5 revenue verification checks on each delivery group."""
 
-    def __init__(self):
-        self.comparator = DataComparator()
+    def verify_all(self, groups: list[DeliveryGroup]) -> VerificationSummary:
+        """Run all 5 checks on all delivery groups."""
+        summary = VerificationSummary(total_groups=len(groups))
 
-    def run_test(self, config: AuditTestConfig, documents: list[ProcessedDocument],
-                 sample_data: pd.DataFrame) -> list[AuditFinding]:
-        """Dispatch to the appropriate test method."""
-        if config.test_type == "vouching":
-            return self.vouching_test(config, documents, sample_data)
-        elif config.test_type == "tracing":
-            return self.tracing_test(config, documents, sample_data)
-        elif config.test_type == "recalculation":
-            return self.recalculation_test(config, documents)
-        elif config.test_type == "analytical":
-            return self.analytical_test(config, documents, sample_data)
+        for group in groups:
+            # Fill info from receipt first
+            self._fill_receipt_info(group)
+
+            # Run 5 checks
+            self.check1_contract_consistency(group)
+            self.check2_delivery_consistency(group)
+            self.check3_revenue_accuracy(group)
+            self.check4_revenue_timing(group)
+            self.check5_signer_authorization(group)
+
+            # Build attachment index and result
+            self._build_attachment_info(group)
+
+            # Update summary
+            summary.total_checked += 1
+            c1 = group.check1_result == "✓"
+            c2 = group.check2_result == "✓"
+            c3 = group.check3_result == "✓"
+            c4 = group.check4_result == "✓"
+            c5 = group.check5_result == "✓"
+
+            if c1: summary.check1_pass += 1
+            else: summary.check1_fail += 1
+            if c2: summary.check2_pass += 1
+            else: summary.check2_fail += 1
+            if c3: summary.check3_pass += 1
+            else: summary.check3_fail += 1
+            if c4: summary.check4_pass += 1
+            else: summary.check4_fail += 1
+            if c5: summary.check5_pass += 1
+            else: summary.check5_fail += 1
+
+            if c1 and c2 and c3 and c4 and c5:
+                summary.all_pass += 1
+
+        return summary
+
+    def _fill_receipt_info(self, group: DeliveryGroup):
+        """Fill logistics/sign info from the matched receipt document."""
+        receipt = group.receipt
+        if receipt is None:
+            return
+
+        group.logistics_company = receipt.logistics_company or ""
+        group.logistics_no = receipt.logistics_no or ""
+        group.customer_sign_date = receipt.sign_date or ""
+        group.signer = receipt.signer or ""
+
+    def check1_contract_consistency(self, group: DeliveryGroup):
+        """① Check system info vs contract/order consistency.
+
+        Compare: customer name, product name, spec model, unit price.
+        """
+        contract = group.contract
+        if contract is None:
+            group.check1_result = "缺合同"
+            return
+
+        mismatches = []
+
+        # Customer name comparison
+        if contract.customer_name:
+            sys_customer = clean_text(group.customer_name)
+            doc_customer = clean_text(contract.customer_name)
+            if sys_customer and doc_customer:
+                if sys_customer not in doc_customer and doc_customer not in sys_customer:
+                    mismatches.append(f"客户名称不一致：系统'{sys_customer}' vs 合同'{doc_customer}'")
+
+        # Product name comparison (contains check, either direction)
+        if contract.product_name:
+            sys_product = clean_text(group.material_name)
+            doc_product = clean_text(contract.product_name)
+            if sys_product and doc_product:
+                if sys_product not in doc_product and doc_product not in sys_product:
+                    mismatches.append(f"产品名称不一致：系统'{sys_product}' vs 合同'{doc_product}'")
+
+        # Spec model comparison (case insensitive)
+        if contract.spec_model:
+            sys_spec = clean_text(group.spec_model).lower()
+            doc_spec = clean_text(contract.spec_model).lower()
+            if sys_spec and doc_spec:
+                if sys_spec != doc_spec:
+                    mismatches.append(f"规格型号不一致：系统'{group.spec_model}' vs 合同'{contract.spec_model}'")
+
+        # Unit price comparison
+        if contract.unit_price is not None and group.unit_price is not None:
+            if contract.unit_price != group.unit_price:
+                mismatches.append(
+                    f"单价不一致：系统{group.unit_price} vs 合同{contract.unit_price}"
+                )
+
+        group.check1_result = "✓" if not mismatches else "; ".join(mismatches)
+
+    def check2_delivery_consistency(self, group: DeliveryGroup):
+        """② Check delivery note info consistency.
+
+        Compare: delivery no, total qty, delivery date vs signed receipt.
+        """
+        receipt = group.receipt
+        if receipt is None:
+            group.check2_result = "缺回签联"
+            return
+
+        mismatches = []
+
+        # Delivery number
+        if receipt.delivery_no:
+            sys_no = clean_text(group.delivery_no)
+            doc_no = clean_text(receipt.delivery_no)
+            if sys_no and doc_no and sys_no != doc_no:
+                mismatches.append(f"出库单号不一致：系统'{sys_no}' vs 回签联'{doc_no}'")
+
+        # Total quantity
+        if receipt.delivery_qty is not None:
+            if group.total_qty != receipt.delivery_qty:
+                mismatches.append(
+                    f"出库数量不一致：系统{group.total_qty} vs 回签联{receipt.delivery_qty}"
+                )
+
+        # Delivery date
+        if receipt.delivery_date:
+            sys_date = clean_text(group.delivery_date)
+            doc_date = clean_text(receipt.delivery_date)
+            if sys_date and doc_date:
+                # Normalize both dates for comparison
+                sys_d = normalize_date(sys_date)
+                doc_d = normalize_date(doc_date)
+                if sys_d and doc_d and sys_d != doc_d:
+                    mismatches.append(
+                        f"出库日期不一致：系统{sys_date} vs 回签联{receipt.delivery_date}"
+                    )
+
+        group.check2_result = "✓" if not mismatches else "; ".join(mismatches)
+
+    def check3_revenue_accuracy(self, group: DeliveryGroup):
+        """③ Check revenue amount accuracy.
+
+        含税收入 = 出库数量汇总 × 产品单价
+        不含税收入 = 含税收入 ÷ 1.13
+        Tolerance: ±1 yuan
+        """
+        if group.unit_price is None or group.total_qty == 0:
+            group.check3_result = "数据不完整，无法计算"
+            return
+
+        tolerance = CONFIG.amount_tolerance
+        tax_rate = CONFIG.tax_rate
+        mismatches = []
+
+        # Calculate expected values
+        expected_tax = group.unit_price * group.total_qty
+        expected_notax = expected_tax / tax_rate
+
+        # Compare 含税收入
+        actual_tax = group.total_revenue_tax
+        diff_tax = abs(actual_tax - expected_tax)
+        if diff_tax > tolerance:
+            mismatches.append(
+                f"含税收入差异：系统{actual_tax} vs 计算{expected_tax}，差{actual_tax - expected_tax}"
+            )
+
+        # Compare 不含税收入
+        actual_notax = group.total_revenue_notax
+        diff_notax = abs(actual_notax - expected_notax)
+        if diff_notax > tolerance:
+            mismatches.append(
+                f"不含税收入差异：系统{actual_notax} vs 计算{expected_notax:.2f}，差{actual_notax - expected_notax:.2f}"
+            )
+
+        group.check3_result = "✓" if not mismatches else "; ".join(mismatches)
+
+    def check4_revenue_timing(self, group: DeliveryGroup):
+        """④ Check revenue confirmation timing compliance.
+
+        Rules:
+        - Customer sign date <= Revenue confirmation date
+        - Both dates in the same month
+        """
+        confirm_date_str = group.confirm_date
+        sign_date_str = group.customer_sign_date
+
+        if not confirm_date_str:
+            group.check4_result = "收入确认日期缺失"
+            return
+
+        if not sign_date_str:
+            group.check4_result = "日期缺失"
+            return
+
+        confirm_d = normalize_date(confirm_date_str)
+        sign_d = _parse_short_date(sign_date_str, confirm_date_str)
+
+        if confirm_d is None:
+            group.check4_result = f"无法解析收入确认日期：{confirm_date_str}"
+            return
+        if sign_d is None:
+            group.check4_result = f"无法解析签收日期：{sign_date_str}"
+            return
+
+        mismatches = []
+
+        # Check: sign date <= confirm date
+        if sign_d > confirm_d:
+            mismatches.append(f"签收{sign_d} > 确认{confirm_d}，时点不合规")
+
+        # Check: same month
+        if sign_d.year != confirm_d.year or sign_d.month != confirm_d.month:
+            mismatches.append(
+                f"签收{sign_d} vs 确认{confirm_d}，跨月"
+            )
+
+        group.check4_result = "✓" if not mismatches else "; ".join(mismatches)
+
+    def check5_signer_authorization(self, group: DeliveryGroup):
+        """⑤ Check if the signer is authorized.
+
+        Rules:
+        - Must have authorization letter
+        - Authorized person name == signer name on receipt (exact match)
+        """
+        auth = group.authorization
+        signer = group.signer
+
+        if auth is None:
+            group.check5_result = "✗ 未提供授权书"
+            return
+
+        if not signer:
+            group.check5_result = "✗ 回签联未识别到签收人"
+            return
+
+        authorized = clean_text(auth.authorized_person)
+        actual_signer = clean_text(signer)
+
+        if not authorized:
+            group.check5_result = "✗ 授权书未识别到被授权人"
+            return
+
+        if authorized == actual_signer:
+            group.check5_result = "✓"
         else:
-            return []
-
-    def vouching_test(self, config: AuditTestConfig, documents: list[ProcessedDocument],
-                      sample_data: pd.DataFrame) -> list[AuditFinding]:
-        """Vouching: verify each Excel sample item exists in the PDF documents.
-
-        For each row in the Excel sample, search across all PDF extracted tables
-        to find a matching record, then compare mapped fields.
-        """
-        findings = []
-        all_pdf_tables = []
-
-        # Collect all tables from all documents
-        for doc in documents:
-            for table in doc.extracted_tables:
-                all_pdf_tables.append((doc.file_name, table))
-
-        # For each sample row
-        for idx, sample_row in sample_data.iterrows():
-            sample_id = str(sample_row.get(config.key_fields[0], idx)) if config.key_fields else str(idx)
-
-            best_match = None
-            best_score = 0.0
-            best_doc_name = ""
-            best_page = 0
-
-            # Search across all PDF tables for a match
-            for doc_name, table in all_pdf_tables:
-                match_result = self._find_match_in_table(
-                    table, sample_row, config.key_fields, config.field_mappings
-                )
-                if match_result and match_result[1] > best_score:
-                    best_match = match_result[0]
-                    best_score = match_result[1]
-                    best_doc_name = doc_name
-                    best_page = table.page_number
-
-            if best_match is None:
-                # No match found
-                findings.append(AuditFinding.create(
-                    test_type="vouching",
-                    status="fail",
-                    severity="high",
-                    sample_id=sample_id,
-                    matched_pdf="",
-                    field_name="record",
-                    extracted_value="NOT FOUND",
-                    expected_value=str(dict(sample_row)),
-                    difference="Missing",
-                    confidence=0.0,
-                    message=f"Sample {sample_id}: No matching record found in any PDF",
-                ))
-                continue
-
-            # Compare mapped fields
-            for pdf_field, excel_field in config.field_mappings.items():
-                if excel_field not in sample_row.index:
-                    continue
-
-                extracted_val = str(best_match.get(pdf_field, ""))
-                expected_val = sample_row[excel_field]
-
-                result = self.comparator.auto_compare(
-                    extracted_val, expected_val,
-                    tolerance=config.amount_tolerance,
-                    tolerance_pct=config.amount_tolerance_pct,
-                    tolerance_days=config.date_tolerance_days,
-                )
-
-                if result.matches:
-                    findings.append(AuditFinding.create(
-                        test_type="vouching",
-                        status="pass",
-                        severity="info",
-                        sample_id=sample_id,
-                        matched_pdf=best_doc_name,
-                        field_name=excel_field,
-                        extracted_value=result.extracted_value,
-                        expected_value=result.expected_value,
-                        difference=result.difference,
-                        confidence=result.confidence,
-                        message=f"Match: {excel_field}",
-                        page_number=best_page,
-                    ))
-                else:
-                    severity = "high" if pdf_field in config.key_fields else "medium"
-                    findings.append(AuditFinding.create(
-                        test_type="vouching",
-                        status="fail",
-                        severity=severity,
-                        sample_id=sample_id,
-                        matched_pdf=best_doc_name,
-                        field_name=excel_field,
-                        extracted_value=result.extracted_value,
-                        expected_value=result.expected_value,
-                        difference=result.difference,
-                        confidence=result.confidence,
-                        message=f"Mismatch: {excel_field} - {result.notes}",
-                        page_number=best_page,
-                    ))
-
-        return findings
-
-    def tracing_test(self, config: AuditTestConfig, documents: list[ProcessedDocument],
-                     sample_data: pd.DataFrame) -> list[AuditFinding]:
-        """Tracing: verify each PDF record has a corresponding entry in the sample.
-
-        Inverse of vouching - start from PDF records and look for them in Excel.
-        """
-        findings = []
-
-        for doc in documents:
-            for table in doc.extracted_tables:
-                df = table.data
-                for row_idx, pdf_row in df.iterrows():
-                    # Try to find this PDF record in the sample data
-                    matched = False
-                    best_sample_id = ""
-
-                    for sample_idx, sample_row in sample_data.iterrows():
-                        score = self._compute_match_score(
-                            pdf_row, sample_row, config.key_fields, config.field_mappings
-                        )
-                        if score > 0.7:
-                            matched = True
-                            best_sample_id = str(sample_row.get(
-                                config.key_fields[0], sample_idx
-                            )) if config.key_fields else str(sample_idx)
-                            break
-
-                    if not matched:
-                        findings.append(AuditFinding.create(
-                            test_type="tracing",
-                            status="fail",
-                            severity="high",
-                            sample_id=f"PDF_row_{row_idx}",
-                            matched_pdf=doc.file_name,
-                            field_name="record",
-                            extracted_value=str(dict(pdf_row)),
-                            expected_value="NOT FOUND IN SAMPLE",
-                            difference="Unmatched",
-                            confidence=0.0,
-                            message=f"PDF record not found in Excel sample",
-                            page_number=table.page_number,
-                        ))
-                    else:
-                        findings.append(AuditFinding.create(
-                            test_type="tracing",
-                            status="pass",
-                            severity="info",
-                            sample_id=best_sample_id,
-                            matched_pdf=doc.file_name,
-                            field_name="record",
-                            extracted_value=str(dict(pdf_row))[:200],
-                            expected_value=f"Matched to sample {best_sample_id}",
-                            difference="",
-                            confidence=0.9,
-                            message=f"Traced to sample {best_sample_id}",
-                            page_number=table.page_number,
-                        ))
-
-        return findings
-
-    def recalculation_test(self, config: AuditTestConfig,
-                           documents: list[ProcessedDocument]) -> list[AuditFinding]:
-        """Recalculation: verify arithmetic in extracted tables."""
-        findings = []
-
-        for doc in documents:
-            for table in doc.extracted_tables:
-                df = table.data
-
-                # Check column sums if sum_columns specified
-                for col_name in config.sum_columns:
-                    if col_name not in df.columns:
-                        continue
-
-                    # Parse all values in the column
-                    values = []
-                    for val in df[col_name]:
-                        parsed = parse_financial_amount(str(val))
-                        if parsed is not None:
-                            values.append(parsed)
-
-                    if not values:
-                        continue
-
-                    calculated_sum = sum(values[:-1], Decimal("0"))  # Exclude last row (assumed total)
-                    reported_total = values[-1] if values else Decimal("0")
-
-                    diff = calculated_sum - reported_total
-                    matches = abs(diff) <= config.amount_tolerance
-
-                    findings.append(AuditFinding.create(
-                        test_type="recalculation",
-                        status="pass" if matches else "fail",
-                        severity="info" if matches else "high",
-                        sample_id=f"{doc.file_name}_p{table.page_number}",
-                        matched_pdf=doc.file_name,
-                        field_name=f"{col_name} column sum",
-                        extracted_value=str(reported_total),
-                        expected_value=str(calculated_sum),
-                        difference=str(diff),
-                        confidence=1.0 if matches else 0.5,
-                        message=f"Column '{col_name}' sum: calculated={calculated_sum}, reported={reported_total}",
-                        page_number=table.page_number,
-                    ))
-
-                # Cross-footing: check row totals if total_column specified
-                if config.total_column and config.total_column in df.columns and config.sum_columns:
-                    for row_idx, row in df.iterrows():
-                        row_sum = Decimal("0")
-                        parseable = True
-                        for col in config.sum_columns:
-                            if col in df.columns and col != config.total_column:
-                                val = parse_financial_amount(str(row.get(col, "")))
-                                if val is not None:
-                                    row_sum += val
-                                else:
-                                    parseable = False
-
-                        if not parseable:
-                            continue
-
-                        reported = parse_financial_amount(str(row.get(config.total_column, "")))
-                        if reported is None:
-                            continue
-
-                        diff = row_sum - reported
-                        matches = abs(diff) <= config.amount_tolerance
-
-                        if not matches:
-                            findings.append(AuditFinding.create(
-                                test_type="recalculation",
-                                status="fail",
-                                severity="medium",
-                                sample_id=f"{doc.file_name}_p{table.page_number}_row{row_idx}",
-                                matched_pdf=doc.file_name,
-                                field_name=f"Row {row_idx} cross-foot",
-                                extracted_value=str(reported),
-                                expected_value=str(row_sum),
-                                difference=str(diff),
-                                confidence=0.8,
-                                message=f"Row {row_idx}: cross-foot mismatch",
-                                page_number=table.page_number,
-                            ))
-
-        return findings
-
-    def analytical_test(self, config: AuditTestConfig, documents: list[ProcessedDocument],
-                        sample_data: pd.DataFrame) -> list[AuditFinding]:
-        """Analytical procedures: ratio analysis, outlier detection, threshold checks."""
-        findings = []
-
-        for doc in documents:
-            for table in doc.extracted_tables:
-                df = table.data
-
-                # For each numeric column, check for outliers
-                for col in df.columns:
-                    values = []
-                    for val in df[col]:
-                        parsed = parse_financial_amount(str(val))
-                        if parsed is not None:
-                            values.append(parsed)
-
-                    if len(values) < 3:
-                        continue
-
-                    # IQR-based outlier detection
-                    sorted_vals = sorted(values)
-                    n = len(sorted_vals)
-                    q1 = sorted_vals[n // 4]
-                    q3 = sorted_vals[3 * n // 4]
-                    iqr = q3 - q1
-
-                    if iqr == 0:
-                        continue
-
-                    lower_bound = q1 - Decimal("1.5") * iqr
-                    upper_bound = q3 + Decimal("1.5") * iqr
-
-                    for i, val in enumerate(values):
-                        if val < lower_bound or val > upper_bound:
-                            findings.append(AuditFinding.create(
-                                test_type="analytical",
-                                status="manual_review",
-                                severity="medium",
-                                sample_id=f"{doc.file_name}_p{table.page_number}_row{i}",
-                                matched_pdf=doc.file_name,
-                                field_name=col,
-                                extracted_value=str(val),
-                                expected_value=f"Range: [{lower_bound}, {upper_bound}]",
-                                difference=str(val - q3 if val > upper_bound else val - q1),
-                                confidence=0.7,
-                                message=f"Outlier detected in '{col}': {val} outside IQR bounds",
-                                page_number=table.page_number,
-                            ))
-
-        # Compare totals against sample data if available
-        if not sample_data.empty and config.field_mappings:
-            for pdf_field, excel_field in config.field_mappings.items():
-                if excel_field not in sample_data.columns:
-                    continue
-
-                # Calculate expected total from sample
-                sample_values = []
-                for val in sample_data[excel_field]:
-                    parsed = parse_financial_amount(str(val))
-                    if parsed is not None:
-                        sample_values.append(parsed)
-
-                if not sample_values:
-                    continue
-
-                sample_total = sum(sample_values, Decimal("0"))
-
-                # Calculate extracted total
-                for doc in documents:
-                    for table in doc.extracted_tables:
-                        if pdf_field not in table.data.columns:
-                            continue
-
-                        pdf_values = []
-                        for val in table.data[pdf_field]:
-                            parsed = parse_financial_amount(str(val))
-                            if parsed is not None:
-                                pdf_values.append(parsed)
-
-                        if not pdf_values:
-                            continue
-
-                        pdf_total = sum(pdf_values, Decimal("0"))
-
-                        if sample_total != 0:
-                            pct_diff = abs(pdf_total - sample_total) / abs(sample_total)
-                        else:
-                            pct_diff = Decimal("0") if pdf_total == 0 else Decimal("1")
-
-                        threshold = config.analytical_threshold_pct
-                        matches = pct_diff <= threshold
-
-                        findings.append(AuditFinding.create(
-                            test_type="analytical",
-                            status="pass" if matches else "fail",
-                            severity="info" if matches else "high",
-                            sample_id="total_comparison",
-                            matched_pdf=doc.file_name,
-                            field_name=f"{excel_field} total",
-                            extracted_value=str(pdf_total),
-                            expected_value=str(sample_total),
-                            difference=f"{pct_diff:.2%}",
-                            confidence=1.0 - float(pct_diff),
-                            message=f"Total comparison: PDF={pdf_total}, Sample={sample_total}, Diff={pct_diff:.2%}",
-                        ))
-
-        return findings
-
-    # --- Internal matching helpers ---
-
-    def _find_match_in_table(self, table: ExtractedTable, sample_row: pd.Series,
-                             key_fields: list[str],
-                             field_mappings: dict[str, str]) -> tuple[pd.Series, float] | None:
-        """Find the best matching row in a table for a sample row."""
-        df = table.data
-        best_row = None
-        best_score = 0.0
-
-        for _, pdf_row in df.iterrows():
-            score = self._compute_match_score(pdf_row, sample_row, key_fields, field_mappings)
-            if score > best_score:
-                best_score = score
-                best_row = pdf_row
-
-        if best_score >= 0.5:
-            return (best_row, best_score)
-        return None
-
-    def _compute_match_score(self, pdf_row: pd.Series, sample_row: pd.Series,
-                             key_fields: list[str],
-                             field_mappings: dict[str, str]) -> float:
-        """Compute a weighted match score between a PDF row and a sample row."""
-        if not field_mappings:
-            return 0.0
-
-        scores = []
-        weights = []
-
-        for pdf_field, excel_field in field_mappings.items():
-            if pdf_field not in pdf_row.index or excel_field not in sample_row.index:
-                continue
-
-            extracted = str(pdf_row[pdf_field])
-            expected = sample_row[excel_field]
-
-            result = self.comparator.auto_compare(extracted, expected)
-
-            weight = 2.0 if pdf_field in key_fields else 1.0
-            scores.append(result.confidence * weight)
-            weights.append(weight)
-
-        if not weights:
-            return 0.0
-
-        return sum(scores) / sum(weights)
+            group.check5_result = f"✗ 授权人\"{authorized}\"≠签收人\"{actual_signer}\""
+
+    def _build_attachment_info(self, group: DeliveryGroup):
+        """Build attachment index string and overall attachment result."""
+        attachments = []
+        idx = 1
+
+        if group.contract:
+            name = group.contract.file_name.replace(".pdf", "").replace(".PDF", "")
+            attachments.append(f"附件{idx}:合同{name}")
+            idx += 1
+        if group.receipt:
+            name = group.receipt.file_name.replace(".pdf", "").replace(".PDF", "")
+            attachments.append(f"附件{idx}:回签联{name}")
+            idx += 1
+        if group.reconciliation:
+            name = group.reconciliation.file_name.replace(".pdf", "").replace(".PDF", "")
+            attachments.append(f"附件{idx}:对账单{name}")
+            idx += 1
+        if group.authorization:
+            name = group.authorization.file_name.replace(".pdf", "").replace(".PDF", "")
+            attachments.append(f"附件{idx}:授权书{name}")
+            idx += 1
+
+        group.attachment_index = "; ".join(attachments) if attachments else ""
+
+        # Overall result
+        checks = [
+            ("①", group.check1_result),
+            ("②", group.check2_result),
+            ("③", group.check3_result),
+            ("④", group.check4_result),
+            ("⑤", group.check5_result),
+        ]
+        failures = [label for label, result in checks if result != "✓"]
+
+        if not failures:
+            group.attachment_result = "全部通过"
+        else:
+            group.attachment_result = "、".join(failures) + "存在异常"
+
+
+def _parse_short_date(date_str: str, reference_date_str: str = "") -> date | None:
+    """Parse short date formats like '4/8' using year context from reference date."""
+    # First try standard formats
+    d = normalize_date(date_str)
+    if d:
+        return d
+
+    # Try short format: M/D or D/M
+    date_str = clean_text(date_str)
+    m = __import__("re").match(r"^(\d{1,2})/(\d{1,2})$", date_str)
+    if m:
+        part1, part2 = int(m.group(1)), int(m.group(2))
+
+        # Determine year from reference date
+        ref_d = normalize_date(reference_date_str)
+        year = ref_d.year if ref_d else datetime.now().year
+
+        # Assume M/D format (month/day)
+        if 1 <= part1 <= 12 and 1 <= part2 <= 31:
+            try:
+                return date(year, part1, part2)
+            except ValueError:
+                pass
+
+    return None
