@@ -12,10 +12,7 @@ from audit.models import DeliveryGroup, VerificationSummary
 from config import EXCEL_COLS
 
 
-# Map our column letters to openpyxl column indices
-_COL_MAP = {k: column_index_from_string(v.replace("A", "")) if len(v) > 1
-             else column_index_from_string(v)
-             for k, v in EXCEL_COLS.items()}
+# No pre-computed map needed — use _col_idx() directly
 
 
 def _col_idx(col_letter: str) -> int:
