@@ -260,15 +260,21 @@ def render_step2(lang: str):
     st.header(t("step2", lang))
 
     st.markdown(
-        """上传佐证文件（PDF格式）。文件应按**出库单号**命名或分组。
+        """提供佐证文件（PDF格式）。支持两种方式：
+- **方式一（推荐）**：输入本地文件夹路径，系统自动扫描所有PDF文件（含子文件夹）
+- **方式二**：手动选择上传PDF文件
+
 系统根据文件名关键词自动分类：
 - **合同/订单**：文件名含"合同""订单""采购""销售"
 - **回签联/送货单**：文件名含"回签联""送货单""出库单""签收"
 - **对账单**：文件名含"对账单"
 - **授权书**：文件名含"授权书""授权"
 """ if lang == "zh" else
-        """Upload supporting documents (PDF). Files should be named/grouped by delivery note number.
-System auto-classifies by filename keywords (contract, receipt, reconciliation, authorization)."""
+        """Provide supporting documents (PDF). Two methods:
+- **Method 1 (Recommended)**: Enter a local folder path, system scans all PDFs (including subfolders)
+- **Method 2**: Manually select and upload PDF files
+
+System auto-classifies by filename keywords."""
     )
 
     groups = st.session_state.get("delivery_groups", [])
@@ -276,58 +282,121 @@ System auto-classifies by filename keywords (contract, receipt, reconciliation, 
         st.warning("请先上传Excel样本（步骤1）" if lang == "zh" else "Upload Excel first (Step 1)")
         return
 
-    # Show delivery note numbers for reference
     with st.expander("出库单号列表（供参考）" if lang == "zh" else "Delivery Note List"):
         dns = [g.delivery_no for g in groups]
         st.write(", ".join(dns))
 
-    uploaded_files = st.file_uploader(
-        t("upload_folder", lang),
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="pdf_up",
-        help="选择所有佐证PDF文件，系统将根据文件名自动匹配出库单号" if lang == "zh"
-             else "Select all supporting PDFs. System auto-matches by filename.",
+    # --- Method selector ---
+    method = st.radio(
+        "选择文件导入方式" if lang == "zh" else "Select import method",
+        ["📁 输入文件夹路径（推荐）" if lang == "zh" else "📁 Enter folder path (Recommended)",
+         "📄 手动上传文件" if lang == "zh" else "📄 Manual file upload"],
+        horizontal=True,
+        key="import_method",
     )
 
-    if uploaded_files:
-        st.info(f"已选择 {len(uploaded_files)} 个文件" if lang == "zh"
-                else f"{len(uploaded_files)} files selected")
+    pdf_files_to_process = []  # list of (file_name, file_bytes_or_path, is_local)
 
-        file_df = pd.DataFrame({
-            "文件名": [f.name for f in uploaded_files],
-            "大小": [f"{f.size/1024:.1f} KB" for f in uploaded_files],
-        })
-        st.dataframe(file_df, use_container_width=True)
+    if "文件夹" in method or "folder" in method.lower():
+        # --- Method 1: Folder path ---
+        folder_path = st.text_input(
+            "输入佐证文件夹的完整路径" if lang == "zh" else "Enter full path to supporting documents folder",
+            placeholder="/Users/yourname/Documents/审计佐证文件" if lang == "zh"
+                        else "/Users/yourname/Documents/audit_docs",
+            key="folder_path",
+        )
 
+        if folder_path:
+            folder_path = folder_path.strip().strip('"').strip("'")
+            if not os.path.isdir(folder_path):
+                st.error(f"文件夹不存在: {folder_path}" if lang == "zh"
+                         else f"Folder not found: {folder_path}")
+            else:
+                # Scan for PDF files recursively
+                pdf_paths = []
+                for root, dirs, files in os.walk(folder_path):
+                    for f in sorted(files):
+                        if f.lower().endswith(".pdf"):
+                            pdf_paths.append(os.path.join(root, f))
+
+                if not pdf_paths:
+                    st.warning("该文件夹中未找到PDF文件" if lang == "zh"
+                               else "No PDF files found in this folder")
+                else:
+                    st.success(
+                        f"找到 {len(pdf_paths)} 个PDF文件" if lang == "zh"
+                        else f"Found {len(pdf_paths)} PDF files"
+                    )
+
+                    file_df = pd.DataFrame({
+                        "文件名": [os.path.basename(p) for p in pdf_paths],
+                        "子目录": [os.path.relpath(os.path.dirname(p), folder_path) or "." for p in pdf_paths],
+                        "大小": [f"{os.path.getsize(p)/1024:.1f} KB" for p in pdf_paths],
+                    })
+                    st.dataframe(file_df, use_container_width=True)
+
+                    pdf_files_to_process = [
+                        (os.path.basename(p), p, True) for p in pdf_paths
+                    ]
+
+    else:
+        # --- Method 2: File upload ---
+        uploaded_files = st.file_uploader(
+            "选择PDF文件" if lang == "zh" else "Select PDF files",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="pdf_up",
+        )
+
+        if uploaded_files:
+            st.info(f"已选择 {len(uploaded_files)} 个文件" if lang == "zh"
+                    else f"{len(uploaded_files)} files selected")
+
+            file_df = pd.DataFrame({
+                "文件名": [f.name for f in uploaded_files],
+                "大小": [f"{f.size/1024:.1f} KB" for f in uploaded_files],
+            })
+            st.dataframe(file_df, use_container_width=True)
+
+            pdf_files_to_process = [
+                (f.name, f, False) for f in uploaded_files
+            ]
+
+    # --- Process button ---
+    if pdf_files_to_process:
         if st.button(t("start_processing", lang), type="primary", use_container_width=True):
             processed = []
-            doc_map = {}  # delivery_no -> list of DocumentInfo
+            doc_map = {}
             progress = st.progress(0)
             status = st.empty()
 
-            for i, f in enumerate(uploaded_files):
-                status.text(f"正在处理: {f.name} ({i+1}/{len(uploaded_files)})")
-                file_bytes = f.read()
-                doc = process_pdf(file_bytes=file_bytes, file_name=f.name)
+            for i, (fname, source, is_local) in enumerate(pdf_files_to_process):
+                status.text(
+                    f"正在处理: {fname} ({i+1}/{len(pdf_files_to_process)})" if lang == "zh"
+                    else f"Processing: {fname} ({i+1}/{len(pdf_files_to_process)})"
+                )
+
+                if is_local:
+                    doc = process_pdf(file_path=source, file_name=fname)
+                else:
+                    file_bytes = source.read()
+                    doc = process_pdf(file_bytes=file_bytes, file_name=fname)
+
                 processed.append(doc)
 
-                # Classify and extract fields
                 doc_info = classify_document(doc)
 
-                # Match to delivery groups by filename
-                matched = _match_doc_to_group(f.name, groups)
+                matched = _match_doc_to_group(fname, groups)
                 for dn in matched:
                     if dn not in doc_map:
                         doc_map[dn] = []
                     doc_map[dn].append(doc_info)
 
-                progress.progress((i + 1) / len(uploaded_files))
+                progress.progress((i + 1) / len(pdf_files_to_process))
 
             st.session_state["processed_docs"] = processed
             st.session_state["doc_map"] = doc_map
 
-            # Assign documents to groups
             _assign_docs_to_groups(groups, doc_map)
 
             if st.session_state["current_step"] < 3:
@@ -335,8 +404,10 @@ System auto-classifies by filename keywords (contract, receipt, reconciliation, 
 
             status.empty()
             progress.empty()
-            st.success(f"处理完成！{len(processed)} 个文件" if lang == "zh"
-                       else f"Done! {len(processed)} files processed")
+            st.success(
+                f"处理完成！{len(processed)} 个文件" if lang == "zh"
+                else f"Done! {len(processed)} files processed"
+            )
 
     # Show matching results
     if st.session_state.get("doc_map"):
