@@ -1,4 +1,4 @@
-"""Table extraction from PDF pages using pdfplumber with fallbacks."""
+"""Table extraction from PDF pages using pdfplumber + OCR text-based fallback."""
 
 import io
 from decimal import Decimal
@@ -16,27 +16,22 @@ except ImportError:
 
 
 class TableExtractor:
-    """Extract tables from PDF pages."""
+    """Extract tables from PDF pages (native and scanned)."""
 
     def extract_tables(self, page: fitz.Page, page_number: int,
                        page_type: str) -> list[ExtractedTable]:
-        """Extract all tables from a page.
+        """Extract all tables from a page."""
+        tables = []
 
-        Uses pdfplumber for native pages, with fallback strategies.
-        """
         if page_type == "scanned":
-            # For scanned pages, pdfplumber won't work well on the raw PDF
-            # We rely on text-based table detection from OCR output
-            return []
+            # For scanned pages, try to reconstruct tables from OCR text
+            tables = self._extract_from_text(page, page_number)
+            return tables
 
         if pdfplumber is None:
             return []
 
-        tables = []
-
-        # Get page bytes for pdfplumber
         try:
-            # Extract single page as PDF bytes
             src_doc = page.parent
             tmp_doc = fitz.open()
             tmp_doc.insert_pdf(src_doc, from_page=page.number, to_page=page.number)
@@ -48,22 +43,21 @@ class TableExtractor:
                     return []
                 plumber_page = pdf.pages[0]
 
-                # Strategy 1: Line-based (for ruled tables)
+                # Strategy 1: Line-based (ruled tables)
                 extracted = self._extract_with_lines(plumber_page)
                 if not extracted:
-                    # Strategy 2: Text-based (for borderless tables)
+                    # Strategy 2: Text-based (borderless tables)
                     extracted = self._extract_with_text(plumber_page)
 
-                for i, raw_table in enumerate(extracted):
+                for raw_table in extracted:
                     df = self._raw_to_dataframe(raw_table)
                     if df is not None and not df.empty:
-                        # Calculate confidence based on data quality
                         confidence = self._estimate_table_confidence(df)
                         tables.append(ExtractedTable(
                             page_number=page_number,
                             data=df,
                             headers=list(df.columns),
-                            bbox=(0, 0, 0, 0),  # simplified
+                            bbox=(0, 0, 0, 0),
                             confidence=confidence,
                             low_confidence_cells=[],
                         ))
@@ -73,8 +67,119 @@ class TableExtractor:
 
         return tables
 
+    def _extract_from_text(self, page: fitz.Page, page_number: int) -> list[ExtractedTable]:
+        """Reconstruct tables from native text positions (for scanned PDFs after OCR)."""
+        tables = []
+        try:
+            text_dict = page.get_text("dict", flags=0)
+            blocks = text_dict.get("blocks", [])
+
+            # Collect all text spans with positions
+            spans = []
+            for block in blocks:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "").strip()
+                        if text:
+                            bbox = span.get("bbox", (0, 0, 0, 0))
+                            spans.append({
+                                "text": text,
+                                "x0": bbox[0], "y0": bbox[1],
+                                "x1": bbox[2], "y1": bbox[3],
+                            })
+
+            if len(spans) < 4:
+                return []
+
+            # Cluster spans into rows by y-coordinate
+            rows = self._cluster_into_rows(spans)
+            if len(rows) < 2:
+                return []
+
+            # Cluster into columns by x-coordinate
+            columns = self._detect_columns(spans)
+            if len(columns) < 2:
+                return []
+
+            # Build table grid
+            grid = []
+            for row_spans in rows:
+                row_data = [""] * len(columns)
+                for span in row_spans:
+                    col_idx = self._find_column(span["x0"], columns)
+                    if col_idx is not None:
+                        if row_data[col_idx]:
+                            row_data[col_idx] += " " + span["text"]
+                        else:
+                            row_data[col_idx] = span["text"]
+                grid.append(row_data)
+
+            df = self._raw_to_dataframe(grid)
+            if df is not None and not df.empty:
+                tables.append(ExtractedTable(
+                    page_number=page_number,
+                    data=df,
+                    headers=list(df.columns),
+                    bbox=(0, 0, 0, 0),
+                    confidence=0.6,  # lower confidence for text-reconstructed tables
+                    low_confidence_cells=[],
+                ))
+
+        except Exception:
+            pass
+
+        return tables
+
+    def _cluster_into_rows(self, spans: list[dict], tolerance: float = 5.0) -> list[list[dict]]:
+        """Cluster text spans into rows by y-coordinate proximity."""
+        if not spans:
+            return []
+
+        sorted_spans = sorted(spans, key=lambda s: s["y0"])
+        rows = []
+        current_row = [sorted_spans[0]]
+        current_y = sorted_spans[0]["y0"]
+
+        for span in sorted_spans[1:]:
+            if abs(span["y0"] - current_y) <= tolerance:
+                current_row.append(span)
+            else:
+                rows.append(sorted(current_row, key=lambda s: s["x0"]))
+                current_row = [span]
+                current_y = span["y0"]
+
+        if current_row:
+            rows.append(sorted(current_row, key=lambda s: s["x0"]))
+
+        return rows
+
+    def _detect_columns(self, spans: list[dict], tolerance: float = 15.0) -> list[float]:
+        """Detect column boundaries from x-coordinates of text spans."""
+        x_starts = sorted(set(round(s["x0"] / tolerance) * tolerance for s in spans))
+
+        # Merge close x positions
+        columns = [x_starts[0]]
+        for x in x_starts[1:]:
+            if x - columns[-1] > tolerance:
+                columns.append(x)
+
+        return columns
+
+    def _find_column(self, x0: float, columns: list[float]) -> int | None:
+        """Find which column a span belongs to."""
+        best_idx = None
+        best_dist = float("inf")
+        for i, col_x in enumerate(columns):
+            dist = abs(x0 - col_x)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        return best_idx if best_dist < 50 else None
+
     def _extract_with_lines(self, page) -> list[list[list[str]]]:
-        """Extract tables using line-based detection (for ruled tables)."""
+        """Extract tables using line-based detection."""
         settings = {
             "vertical_strategy": "lines",
             "horizontal_strategy": "lines",
@@ -88,7 +193,7 @@ class TableExtractor:
             return []
 
     def _extract_with_text(self, page) -> list[list[list[str]]]:
-        """Extract tables using text alignment (for borderless tables)."""
+        """Extract tables using text alignment."""
         settings = {
             "vertical_strategy": "text",
             "horizontal_strategy": "text",
@@ -102,25 +207,16 @@ class TableExtractor:
             return []
 
     def _raw_to_dataframe(self, raw_table: list[list[str]]) -> pd.DataFrame | None:
-        """Convert raw table (list of rows) to a clean DataFrame."""
+        """Convert raw table to a clean DataFrame."""
         if not raw_table or len(raw_table) < 2:
             return None
 
-        # Clean cells
         cleaned = []
         for row in raw_table:
-            cleaned_row = []
-            for cell in row:
-                if cell is None:
-                    cleaned_row.append("")
-                else:
-                    cleaned_row.append(str(cell).strip())
-            cleaned_row = cleaned_row
-            cleaned.append(cleaned_row)
+            cleaned.append([str(cell).strip() if cell else "" for cell in row])
 
         # Use first row as header
         headers = cleaned[0]
-        # Ensure unique headers
         seen = {}
         unique_headers = []
         for h in headers:
@@ -136,7 +232,6 @@ class TableExtractor:
         if not data_rows:
             return None
 
-        # Ensure all rows have same length as headers
         max_cols = len(unique_headers)
         normalized_rows = []
         for row in data_rows:
@@ -149,7 +244,7 @@ class TableExtractor:
         return pd.DataFrame(normalized_rows, columns=unique_headers)
 
     def _estimate_table_confidence(self, df: pd.DataFrame) -> float:
-        """Estimate extraction confidence for a table."""
+        """Estimate extraction confidence based on data quality."""
         if df.empty:
             return 0.0
 
@@ -157,7 +252,6 @@ class TableExtractor:
         empty_cells = (df == "").sum().sum() + df.isna().sum().sum()
         non_empty_ratio = 1.0 - (empty_cells / total_cells) if total_cells > 0 else 0.0
 
-        # Tables with too many empty cells are likely misdetected
         if non_empty_ratio < 0.3:
             return 0.3
 

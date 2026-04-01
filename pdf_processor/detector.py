@@ -1,21 +1,19 @@
-"""PDF page type detection: native, scanned, or mixed."""
+"""PDF page type detection: native, scanned, or mixed (CJK-aware)."""
 
 import fitz
 
 from config import CONFIG
+from utils.helpers import count_cjk_chars
 
 
 class PDFDetector:
     """Classify each page of a PDF as native, scanned, or mixed."""
 
     def classify_page(self, page: fitz.Page) -> str:
-        """Classify a single page.
-
-        Returns: 'native', 'scanned', or 'mixed'
-        """
-        # Extract text character count
+        """Classify a single page. Returns: 'native', 'scanned', or 'mixed'."""
         text = page.get_text("text") or ""
         char_count = len(text.strip())
+        cjk_count = count_cjk_chars(text)
 
         # Check for images
         images = page.get_images(full=True)
@@ -33,8 +31,9 @@ class PDFDetector:
 
         image_area_ratio = total_image_area / page_area if page_area > 0 else 0
 
-        # Classification logic
-        has_enough_text = char_count >= CONFIG.native_text_min_chars
+        # CJK-aware classification: 30 CJK chars is enough to be "native"
+        has_enough_text = (char_count >= CONFIG.native_text_min_chars or
+                          cjk_count >= CONFIG.native_cjk_min_chars)
         has_dominant_image = image_area_ratio >= CONFIG.scanned_image_area_ratio
 
         if has_enough_text and not has_dominant_image:
@@ -44,9 +43,8 @@ class PDFDetector:
         elif has_enough_text and has_dominant_image:
             return "mixed"
         else:
-            # Very little text, no dominant image → likely blank or sparse
-            if char_count < 10:
-                return "scanned"  # treat as scanned to attempt OCR
+            if char_count < 10 and cjk_count < 5:
+                return "scanned"
             return "native"
 
     def classify_document(self, doc: fitz.Document) -> list[str]:
